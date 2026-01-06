@@ -1,0 +1,16 @@
+{
+  "name": "arbor-interview-chat-capture",
+  "version": "1.0.0",
+  "description": "Capture live chat messages from Arbor interview sessions",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "node capture-chats.js",
+    "electron": "electron .",
+    "electron-dev": "DEBUG=1 electron ."
+  },
+  "dependencies": {
+    "@google/genai": "^1.34.0",
+    "electron": "^28.0.0",
+    "puppeteer": "^24.15.0"
+  }
+}

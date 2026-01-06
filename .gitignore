@@ -1,0 +1,7 @@
+node_modules/
+*.log
+chats-*.txt
+.env
+secrets.local.json
+.DS_Store
+
