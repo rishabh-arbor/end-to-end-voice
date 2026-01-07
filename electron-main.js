@@ -752,46 +752,44 @@ function createWindow() {
       return { ws, isReady: function() { return ready; } };
     }
 
-    // Capture Umi audio from LiveKit audio elements (more reliable than BlackHole)
-    function captureUmiFromLiveKit() {
+    // Capture Umi audio from SPEAKERS ONLY (system audio via BlackHole or getDisplayMedia)
+    function captureUmiFromSpeakers() {
       return new Promise(function(resolve) {
-        var checkInterval = setInterval(function() {
-          // LiveKit creates audio elements for remote participants
-          var audioEls = document.querySelectorAll('audio');
-          for (var i = 0; i < audioEls.length; i++) {
-            var el = audioEls[i];
-            // Look for audio element with a srcObject (MediaStream from WebRTC)
-            if (el.srcObject && el.srcObject.getAudioTracks && el.srcObject.getAudioTracks().length > 0) {
-              console.log('[audio][umi] Found LiveKit audio element with', el.srcObject.getAudioTracks().length, 'audio tracks');
-              clearInterval(checkInterval);
-              resolve(el.srcObject.clone()); // Clone the stream
-              return;
-            }
-          }
-          // Also check for any playing audio with captureStream support
-          for (var j = 0; j < audioEls.length; j++) {
-            var el2 = audioEls[j];
-            if (!el2.paused && el2.captureStream) {
-              console.log('[audio][umi] Found playing audio element, using captureStream');
-              clearInterval(checkInterval);
-              resolve(el2.captureStream());
-              return;
-            }
-          }
-        }, 500);
-        // Timeout after 30 seconds
-        setTimeout(function() {
-          clearInterval(checkInterval);
-          console.log('[audio][umi] LiveKit audio element not found, falling back to BlackHole');
-          startStream({ label: 'umi', matcher: function(d){ return d.label.toLowerCase().includes('blackhole'); }, logTag: '[🔊 UMI VOICE]' })
-            .then(resolve);
-        }, 30000);
+        console.log('[audio][umi] Capturing from speakers (system audio)...');
+        
+        // Try BlackHole first (requires Multi-Output Device setup)
+        startStream({ label: 'umi', matcher: function(d){ return d.label.toLowerCase().includes('blackhole'); }, logTag: '[🔊 UMI VOICE]' })
+          .then(function(stream) {
+            console.log('[audio][umi] ✓ BlackHole stream obtained (system audio)');
+            resolve(stream);
+          })
+          .catch(function(err) {
+            console.log('[audio][umi] ⚠️ BlackHole failed:', err.message);
+            console.log('[audio][umi] Trying getDisplayMedia for system audio capture...');
+            // Fallback: use getDisplayMedia for system audio (requires user permission)
+            navigator.mediaDevices.getDisplayMedia({ 
+              audio: { 
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false
+              },
+              video: false 
+            }).then(function(stream) {
+              console.log('[audio][umi] ✓ getDisplayMedia stream obtained (system audio)');
+              resolve(stream);
+            }).catch(function(err2) {
+              console.error('[audio][umi] ❌ System audio capture failed:', err2.message);
+              console.error('[audio][umi] Make sure Multi-Output Device is set up with BlackHole, or grant screen/audio capture permission');
+              // Return null to prevent crash
+              resolve(null);
+            });
+          });
       });
     }
 
     // Start both captures
     Promise.all([
-      captureUmiFromLiveKit(),
+      captureUmiFromSpeakers(),  // Capture from speakers only (system audio)
       startStream({ label: 'user', matcher: function(d){ return d.label.toLowerCase().includes('mic') || d.label.toLowerCase().includes('microphone'); }, logTag: '[🎤 USER VOICE]' })
     ]).then(function([umiStream, userStream]) {
 
