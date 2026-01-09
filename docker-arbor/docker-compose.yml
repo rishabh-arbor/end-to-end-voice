@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  interview-bot:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: interview-bot
+    
+    # Environment variables (can be overridden)
+    environment:
+      # Required
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - INTERVIEW_URL=${INTERVIEW_URL}
+      - INTERVIEW_PASSWORD=${INTERVIEW_PASSWORD:-}
+      
+      # Optional audio settings
+      - AUDIO_SAMPLE_RATE=${AUDIO_SAMPLE_RATE:-16000}
+      - TTS_SAMPLE_RATE=${TTS_SAMPLE_RATE:-24000}
+      
+      # Optional logging/behavior
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1800}
+      - DEBUG=${DEBUG:-0}
+      
+      # PulseAudio
+      - PULSE_SERVER=unix:/run/pulse/native
+      - XDG_RUNTIME_DIR=/run/pulse
+      
+      # VNC/Display settings (set HEADLESS=false to see the browser)
+      - HEADLESS=${HEADLESS:-false}
+      - DISPLAY=:99
+    
+    # Expose ports
+    ports:
+      - "3000:3000"    # Health check
+      - "5900:5900"    # VNC (use VNC client)
+      - "6080:6080"    # noVNC (view in browser at http://localhost:6080)
+    
+    # Capabilities for audio
+    cap_add:
+      - SYS_NICE
+      - SYS_PTRACE
+      
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    
+    # Shared memory for Chromium
+    shm_size: '2gb'
+    
+    # Security options for Chromium
+    security_opt:
+      - seccomp:unconfined
+    
+    # Volumes for persistence (optional)
+    volumes:
+      - ./logs:/app/logs
+      - ./recordings:/app/recordings
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# Optional: named volumes for persistent storage
+volumes:
+  logs:
+  recordings:
+

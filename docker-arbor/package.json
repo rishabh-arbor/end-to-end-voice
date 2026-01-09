@@ -1,0 +1,24 @@
+{
+  "name": "interview-bot-docker",
+  "version": "1.0.0",
+  "description": "Dockerized interview bot with virtual audio and headless browser",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "LOG_LEVEL=debug node src/index.js",
+    "docker:build": "docker-compose build",
+    "docker:up": "docker-compose up",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f"
+  },
+  "dependencies": {
+    "puppeteer-core": "^21.6.1",
+    "ws": "^8.14.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "author": "",
+  "license": "MIT"
+}
+

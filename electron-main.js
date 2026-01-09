@@ -752,38 +752,97 @@ function createWindow() {
       return { ws, isReady: function() { return ready; } };
     }
 
-    // Capture Umi audio from SPEAKERS ONLY (system audio via BlackHole or getDisplayMedia)
+    // Capture Umi audio from SPEAKERS ONLY (system audio - cross-platform)
     function captureUmiFromSpeakers() {
       return new Promise(function(resolve) {
         console.log('[audio][umi] Capturing from speakers (system audio)...');
         
-        // Try BlackHole first (requires Multi-Output Device setup)
-        startStream({ label: 'umi', matcher: function(d){ return d.label.toLowerCase().includes('blackhole'); }, logTag: '[🔊 UMI VOICE]' })
-          .then(function(stream) {
-            console.log('[audio][umi] ✓ BlackHole stream obtained (system audio)');
-            resolve(stream);
-          })
-          .catch(function(err) {
-            console.log('[audio][umi] ⚠️ BlackHole failed:', err.message);
-            console.log('[audio][umi] Trying getDisplayMedia for system audio capture...');
-            // Fallback: use getDisplayMedia for system audio (requires user permission)
-            navigator.mediaDevices.getDisplayMedia({ 
-              audio: { 
-                echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false
-              },
-              video: false 
-            }).then(function(stream) {
-              console.log('[audio][umi] ✓ getDisplayMedia stream obtained (system audio)');
+        // Detect platform (darwin = macOS, linux = Linux)
+        var platform = navigator.platform.toLowerCase();
+        var isMacOS = platform.includes('mac') || platform.includes('darwin');
+        var isLinux = platform.includes('linux');
+        
+        // Platform-specific audio device matcher
+        var deviceMatcher;
+        var deviceName;
+        
+        if (isMacOS) {
+          // macOS: Use BlackHole to capture system audio
+          // BlackHole receives system audio via Multi-Output Device
+          deviceMatcher = function(d) { 
+            return d.label.toLowerCase().includes('blackhole'); 
+          };
+          deviceName = 'BlackHole (system audio)';
+        } else if (isLinux) {
+          // Linux: Use PulseAudio null sink
+          deviceMatcher = function(d) { 
+            return d.label.toLowerCase().includes('virtual') || 
+                   d.label.toLowerCase().includes('null-sink') ||
+                   d.label.toLowerCase().includes('remap') ||
+                   d.label.toLowerCase().includes('monitor');
+          };
+          deviceName = 'PulseAudio null sink';
+        } else {
+          // Windows/Other: Try common virtual audio names
+          deviceMatcher = function(d) { 
+            return d.label.toLowerCase().includes('virtual') || 
+                   d.label.toLowerCase().includes('loopback');
+          };
+          deviceName = 'Virtual audio device';
+        }
+        
+        // Try platform-specific method first
+        if (deviceMatcher) {
+          startStream({ label: 'umi', matcher: deviceMatcher, logTag: '[🔊 UMI VOICE]' })
+            .then(function(stream) {
+              console.log('[audio][umi] ✓ ' + deviceName + ' stream obtained');
               resolve(stream);
-            }).catch(function(err2) {
-              console.error('[audio][umi] ❌ System audio capture failed:', err2.message);
-              console.error('[audio][umi] Make sure Multi-Output Device is set up with BlackHole, or grant screen/audio capture permission');
-              // Return null to prevent crash
-              resolve(null);
+            })
+            .catch(function(err) {
+              console.log('[audio][umi] ⚠️ ' + deviceName + ' failed:', err.message);
+              console.log('[audio][umi] Trying getDisplayMedia as fallback...');
+              tryGetDisplayMedia(resolve, isMacOS, isLinux);
             });
-          });
+        } else {
+          // No platform-specific method, go straight to getDisplayMedia
+          tryGetDisplayMedia(resolve, isMacOS, isLinux);
+        }
+      });
+    }
+    
+    // Fallback: getDisplayMedia (works on both platforms, but with limitations)
+    function tryGetDisplayMedia(resolve, isMacOS, isLinux) {
+      navigator.mediaDevices.getDisplayMedia({ 
+        audio: { 
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        },
+        video: false 
+      })
+      .then(function(stream) {
+        console.log('[audio][umi] ✓ getDisplayMedia stream obtained');
+        resolve(stream);
+      })
+      .catch(function(err) {
+        console.error('[audio][umi] ❌ System audio capture failed:', err.message);
+        
+        // Platform-specific setup instructions
+        if (isMacOS) {
+          console.error('[audio][umi] macOS Setup Required:');
+          console.error('  1. Install BlackHole 2ch: https://github.com/ExistentialAudio/BlackHole');
+          console.error('  2. Create Multi-Output Device in Audio MIDI Setup');
+          console.error('  3. Add MacBook Speakers + BlackHole 2ch');
+          console.error('  4. Set system output to Multi-Output Device');
+        } else if (isLinux) {
+          console.error('[audio][umi] Linux Setup Required:');
+          console.error('  1. Install PulseAudio: sudo apt-get install pulseaudio');
+          console.error('  2. Create null sink: pactl load-module module-null-sink sink_name=virtual_speaker');
+          console.error('  3. Set default sink: pactl set-default-sink virtual_speaker');
+          console.error('  4. Create remap source: pactl load-module module-remap-source master=virtual_speaker.monitor');
+        }
+        
+        resolve(null);
       });
     }
 
