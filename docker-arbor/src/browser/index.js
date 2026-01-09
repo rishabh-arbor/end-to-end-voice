@@ -1,18 +1,31 @@
 /**
  * Browser Module Index
  * 
- * Exports all browser-related functionality
+ * @module browser
+ * @description Re-exports all browser-related modules for convenient importing.
+ *              Provides unified access to browser launching, page control, and automation.
+ * 
+ * @example
+ * const { launchBrowser, navigateToInterview, injectAutomation } = require('./browser');
+ * 
+ * const browser = await launchBrowser();
+ * const page = await browser.newPage();
+ * await navigateToInterview(page, url);
  */
 
-const { launchBrowser, closeBrowser, DEFAULT_OPTIONS } = require('./puppeteer-launcher');
-const { navigateToInterview, setupAudioDevices, injectAutomation } = require('./page-controller');
+'use strict';
+
+const puppeteerLauncher = require('./puppeteer-launcher');
+const pageController = require('./page-controller');
 
 module.exports = {
-  launchBrowser,
-  closeBrowser,
-  DEFAULT_OPTIONS,
-  navigateToInterview,
-  setupAudioDevices,
-  injectAutomation,
+  // From puppeteer-launcher
+  launchBrowser: puppeteerLauncher.launchBrowser,
+  closeBrowser: puppeteerLauncher.closeBrowser,
+  DEFAULT_OPTIONS: puppeteerLauncher.DEFAULT_OPTIONS,
+  
+  // From page-controller
+  navigateToInterview: pageController.navigateToInterview,
+  setupAudioDevices: pageController.setupAudioDevices,
+  injectAutomation: pageController.injectAutomation,
 };
-

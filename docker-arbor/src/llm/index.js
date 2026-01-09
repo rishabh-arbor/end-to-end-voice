@@ -1,14 +1,27 @@
 /**
  * LLM Module Index
  * 
- * Exports all LLM-related functionality
+ * @module llm
+ * @description Re-exports all LLM-related modules for convenient importing.
+ *              Provides access to the Gemini client and conversation management.
+ * 
+ * @example
+ * const { createLLMClient, createConversation } = require('./llm');
+ * 
+ * const client = createLLMClient({ apiKey: '...' });
+ * const conversation = createConversation({ llmClient: client });
  */
 
-const { createLLMClient } = require('./client');
-const { createConversation } = require('./conversation');
+'use strict';
+
+const client = require('./client');
+const conversation = require('./conversation');
 
 module.exports = {
-  createLLMClient,
-  createConversation,
+  // From client
+  createLLMClient: client.createLLMClient,
+  EventType: client.EventType,
+  
+  // From conversation
+  createConversation: conversation.createConversation,
 };
-

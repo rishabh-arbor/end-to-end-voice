@@ -310,7 +310,51 @@
       // Create a destination to merge all audio sources
       const merger = captureContext.createChannelMerger(2);
       
-      // Intercept RTCPeerConnection to capture WebRTC audio
+      // === TTS OUTPUT TO WEBRTC ===
+      // Create an AudioContext for TTS output to WebRTC
+      const ttsOutputContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+      const ttsMediaStreamDestination = ttsOutputContext.createMediaStreamDestination();
+      const ttsOutputStream = ttsMediaStreamDestination.stream;
+      let activePeerConnection = null;
+      let originalMicTrack = null;
+      
+      log('info', '🔊 TTS output stream created for WebRTC injection');
+      
+      // Function to play TTS audio directly to WebRTC
+      window.__arborPlayTTSToWebRTC = async function(pcmData, sampleRate) {
+        try {
+          // Resume context if suspended
+          if (ttsOutputContext.state === 'suspended') {
+            await ttsOutputContext.resume();
+          }
+          
+          // Convert Int16 PCM to Float32
+          const float32Data = new Float32Array(pcmData.length);
+          for (let i = 0; i < pcmData.length; i++) {
+            float32Data[i] = pcmData[i] / 32768;
+          }
+          
+          // Create audio buffer
+          const audioBuffer = ttsOutputContext.createBuffer(1, float32Data.length, sampleRate);
+          audioBuffer.getChannelData(0).set(float32Data);
+          
+          // Play to the media stream destination
+          const source = ttsOutputContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(ttsMediaStreamDestination);
+          source.start();
+          
+          // Wait for playback to complete
+          return new Promise(function(resolve) {
+            source.onended = resolve;
+            setTimeout(resolve, (float32Data.length / sampleRate) * 1000 + 50);
+          });
+        } catch (e) {
+          log('error', 'TTS to WebRTC error:', e.message);
+        }
+      };
+      
+      // Intercept RTCPeerConnection to capture WebRTC audio AND inject our TTS
       function interceptWebRTC() {
         if (window._arborWebRTCIntercepted) return;
         window._arborWebRTCIntercepted = true;
@@ -319,7 +363,11 @@
         
         window.RTCPeerConnection = function(config) {
           const pc = new OriginalRTCPeerConnection(config);
+          activePeerConnection = pc; // Store reference for TTS injection
           
+          log('info', '📡 RTCPeerConnection created - will inject TTS audio');
+          
+          // Capture incoming audio (from Umi)
           pc.addEventListener('track', function(event) {
             if (event.track.kind === 'audio') {
               log('info', '🎤 WebRTC audio track received!');
@@ -335,13 +383,70 @@
             }
           });
           
+          // Override addTrack to intercept and replace microphone track
+          const originalAddTrack = pc.addTrack.bind(pc);
+          pc.addTrack = function(track, ...streams) {
+            if (track.kind === 'audio') {
+              log('info', '🎙️ Intercepting outgoing audio track');
+              originalMicTrack = track;
+              
+              // Add our TTS track instead
+              const ttsTrack = ttsOutputStream.getAudioTracks()[0];
+              if (ttsTrack) {
+                log('info', '✓ Replaced microphone with TTS output stream');
+                return originalAddTrack(ttsTrack, ...streams);
+              }
+            }
+            return originalAddTrack(track, ...streams);
+          };
+          
           return pc;
         };
         
         // Copy prototype
         window.RTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
         
-        log('info', 'WebRTC interceptor installed');
+        // Also intercept getUserMedia to disable audio processing and capture the mic track
+        const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+        navigator.mediaDevices.getUserMedia = async function(constraints) {
+          // CRITICAL: Modify audio constraints to disable processing that filters loopback audio
+          if (constraints.audio) {
+            log('info', '🎙️ getUserMedia called with audio - disabling audio processing for loopback');
+            
+            // If audio is just 'true', replace with detailed constraints
+            if (constraints.audio === true) {
+              constraints.audio = {};
+            }
+            
+            // Disable all audio processing that might filter our TTS audio
+            constraints.audio = {
+              ...constraints.audio,
+              echoCancellation: false,      // CRITICAL: Don't filter "echo" (our TTS)
+              noiseSuppression: false,      // CRITICAL: Don't suppress our audio
+              autoGainControl: false,       // Don't adjust gain
+              googEchoCancellation: false,
+              googAutoGainControl: false,
+              googNoiseSuppression: false,
+              googHighpassFilter: false,
+            };
+            
+            log('info', '🔧 Audio constraints modified:', JSON.stringify(constraints.audio));
+          }
+          
+          const stream = await originalGetUserMedia(constraints);
+          
+          if (constraints.audio) {
+            const audioTrack = stream.getAudioTracks()[0];
+            if (audioTrack) {
+              originalMicTrack = audioTrack;
+              log('info', '✓ Mic track captured:', audioTrack.label);
+            }
+          }
+          
+          return stream;
+        };
+        
+        log('info', 'WebRTC interceptor installed (with audio processing disabled)');
       }
       
       // Install WebRTC interceptor early
@@ -602,17 +707,40 @@
     const item = playbackQueue.shift();
     
     try {
-      // Check if Node.js bridge is available
-      const hasNativeBridge = typeof window.__arborPlayAudio === 'function';
-      console.log('[arbor] __arborPlayAudio function:', hasNativeBridge ? 'AVAILABLE' : 'NOT FOUND');
+      // Decode base64 to Int16 PCM for WebRTC injection
+      const binaryString = atob(item.data);
+      const pcmData = new Int16Array(binaryString.length / 2);
+      for (let i = 0; i < pcmData.length; i++) {
+        pcmData[i] = binaryString.charCodeAt(i * 2) | (binaryString.charCodeAt(i * 2 + 1) << 8);
+      }
       
-      if (hasNativeBridge) {
-        console.log('[arbor] Calling paplay with data length:', item.data.length, 'rate:', item.rate);
+      // Check available audio bridges
+      const hasPaplayBridge = typeof window.__arborPlayAudio === 'function';
+      const hasWebRTCBridge = typeof window.__arborPlayTTSToWebRTC === 'function';
+      
+      console.log('[arbor] Audio bridges - paplay:', hasPaplayBridge ? 'YES' : 'NO', 'WebRTC:', hasWebRTCBridge ? 'YES' : 'NO');
+      
+      // ============================================================
+      // PRIMARY: Play via paplay (Real Audio Flow)
+      // TTS → PulseAudio speaker → loopback → virtual mic → browser → Umi
+      // This gives a real customer experience
+      // ============================================================
+      if (hasPaplayBridge) {
+        console.log('[arbor] PRIMARY: Playing via paplay (real audio flow to Umi)');
         await window.__arborPlayAudio(item.data, item.rate);
         console.log('[arbor] paplay completed');
+      }
+      
+      // ============================================================
+      // SECONDARY/FALLBACK: WebRTC injection (if paplay fails)
+      // Only used as backup - directly injects into WebRTC stream
+      // ============================================================
+      else if (hasWebRTCBridge) {
+        console.log('[arbor] FALLBACK: Using WebRTC injection (paplay not available)');
+        await window.__arborPlayTTSToWebRTC(pcmData, item.rate);
+        console.log('[arbor] WebRTC injection completed');
       } else {
-        console.log('[arbor] Using browser fallback');
-        await playViaBrowser(item.data, item.rate);
+        console.warn('[arbor] No audio playback method available!');
       }
     } catch (e) {
       console.error('[arbor] Playback error:', e.message);

@@ -1,41 +1,120 @@
 /**
- * Puppeteer Launcher - Launches headless Chrome with appropriate settings
+ * Puppeteer Launcher Module
+ * 
+ * @module browser/puppeteer-launcher
+ * @description Launches and manages headless Chrome instances with appropriate
+ *              settings for Docker environments and audio handling.
+ * 
+ * @example
+ * const { launchBrowser, closeBrowser } = require('./puppeteer-launcher');
+ * 
+ * const browser = await launchBrowser();
+ * const page = await browser.newPage();
+ * // ... use the page
+ * await closeBrowser(browser);
+ * 
+ * SOLID Principles Applied:
+ * - Single Responsibility: Only handles browser launching/closing
+ * - Open/Closed: Configurable via options and DEFAULT_OPTIONS
+ * - Dependency Inversion: Uses puppeteer-core (injected dependency)
  */
+
+'use strict';
 
 const puppeteer = require('puppeteer-core');
 
-// Check if headless mode should be disabled
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+/**
+ * Check if headless mode should be disabled
+ * Defaults to headless unless explicitly disabled via env or args
+ * @type {boolean}
+ */
 const HEADLESS = process.env.HEADLESS !== 'false' && !process.argv.includes('--no-headless');
 
-// Determine executable path based on platform
+/**
+ * Determines the Chrome/Chromium executable path based on platform
+ * Checks environment variable first, then falls back to platform defaults
+ * 
+ * @private
+ * @returns {string} Path to Chrome/Chromium executable
+ */
 function getExecutablePath() {
+  // Allow override via environment variable
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     return process.env.PUPPETEER_EXECUTABLE_PATH;
   }
-  if (process.platform === 'darwin') {
-    return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  
+  // Platform-specific defaults
+  switch (process.platform) {
+    case 'darwin':
+      return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    case 'win32':
+      return 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+    default:
+      return '/usr/bin/chromium';
   }
-  return '/usr/bin/chromium';
 }
 
-// Default browser launch options
+/**
+ * Default browser launch options
+ * Configured for Docker environments with virtual audio support
+ * 
+ * @constant {Object}
+ */
 const DEFAULT_OPTIONS = {
+  /**
+   * Whether to run browser in headless mode
+   * @type {boolean}
+   */
   headless: HEADLESS,
+  
+  /**
+   * Path to Chrome/Chromium executable
+   * @type {string}
+   */
   executablePath: getExecutablePath(),
+  
+  /**
+   * Chrome launch arguments
+   * @type {string[]}
+   */
   args: [
-    // Required for Docker
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
+    // ===========================================
+    // DOCKER / CONTAINER REQUIREMENTS
+    // ===========================================
+    '--no-sandbox',                           // Required for Docker
+    '--disable-setuid-sandbox',               // Required for Docker
+    '--disable-dev-shm-usage',                // Prevents /dev/shm issues in Docker
     
-    // Audio settings - use REAL PulseAudio devices (not fake)
-    '--use-fake-ui-for-media-stream',      // Auto-allow mic/camera permissions (but use real devices)
+    // ===========================================
+    // AUDIO CONFIGURATION
+    // ===========================================
+    
+    // Auto-allow microphone/camera permissions (but use real devices)
+    '--use-fake-ui-for-media-stream',
     '--autoplay-policy=no-user-gesture-required',
-    '--alsa-output-device=default',
-    '--alsa-input-device=default',
     
-    // Performance optimizations (disable GPU only in headless)
-    HEADLESS ? '--disable-gpu' : '',
+    // Enable PulseAudio support and loopback features
+    '--enable-features=PulseAudioLoopbackForScreenShare,PulseAudioLoopbackForCast',
+    
+    // CRITICAL: Disable audio processing that filters loopback audio
+    // Echo cancellation/noise suppression would remove our TTS audio
+    '--disable-features=WebRtcAecDump,AudioServiceOutOfProcess,WebRtcUseEchoCanceller3',
+    '--disable-rtc-smoothness-algorithm',
+    '--disable-webrtc-hw-encoding',
+    '--disable-webrtc-hw-decoding',
+    '--disable-audio-output-resampler',
+    
+    // Don't mute audio (we need it for capture/playback)
+    '--mute-audio=false',
+    
+    // ===========================================
+    // PERFORMANCE OPTIMIZATIONS
+    // ===========================================
+    HEADLESS ? '--disable-gpu' : '',          // Disable GPU only in headless mode
     '--disable-software-rasterizer',
     '--disable-background-networking',
     '--disable-default-apps',
@@ -43,52 +122,75 @@ const DEFAULT_OPTIONS = {
     '--disable-sync',
     '--disable-translate',
     '--metrics-recording-only',
-    '--mute-audio=false',  // Don't mute audio (we need it for capture)
     '--no-first-run',
     
-    // Window size and position
+    // ===========================================
+    // WINDOW CONFIGURATION
+    // ===========================================
     '--window-size=1920,1080',
     '--window-position=0,0',
+    '--start-maximized',                      // For VNC display
     
-    // For VNC display
-    '--start-maximized',
-    
-    // CRITICAL: Disable WebRTC audio processing that filters loopback
-    '--disable-features=WebRtcAecDump,AudioServiceOutOfProcess',
-    '--disable-rtc-smoothness-algorithm',
-    '--disable-webrtc-hw-encoding',
-    '--disable-webrtc-hw-decoding',
-    // Disable echo cancellation, noise suppression, auto gain
-    '--enable-features=WebRtcHideLocalIpsWithMdns',
-  ].filter(Boolean),
+  ].filter(Boolean),  // Remove empty strings
+  
+  /**
+   * Default viewport dimensions
+   */
   defaultViewport: {
     width: 1920,
     height: 1080,
   },
-  // Increase timeouts for slower environments
+  
+  /**
+   * Operation timeout in milliseconds
+   */
   timeout: 60000,
 };
 
+// ============================================================
+// BROWSER LIFECYCLE
+// ============================================================
+
 /**
- * Launch a new browser instance
- * @param {object} options - Additional launch options
- * @returns {Promise<Browser>}
+ * Launches a new browser instance with the specified options
+ * 
+ * @async
+ * @param {Object} [options={}] - Additional launch options to merge
+ * @param {string[]} [options.args=[]] - Additional Chrome arguments
+ * @param {boolean} [options.headless] - Override headless mode
+ * @param {string} [options.executablePath] - Override executable path
+ * @returns {Promise<import('puppeteer').Browser>} Puppeteer browser instance
+ * @throws {Error} If browser fails to launch
+ * 
+ * @example
+ * // Launch with defaults
+ * const browser = await launchBrowser();
+ * 
+ * @example
+ * // Launch with custom options
+ * const browser = await launchBrowser({
+ *   args: ['--proxy-server=localhost:8080'],
+ *   headless: false,
+ * });
  */
 async function launchBrowser(options = {}) {
+  // Merge options with defaults
   const mergedOptions = {
     ...DEFAULT_OPTIONS,
     ...options,
+    // Merge args arrays instead of replacing
     args: [...DEFAULT_OPTIONS.args, ...(options.args || [])],
   };
   
   console.log('[browser] Launching browser with executable:', mergedOptions.executablePath);
   console.log('[browser] Headless:', mergedOptions.headless);
   
+  // Launch browser
   const browser = await puppeteer.launch(mergedOptions);
   
   console.log('[browser] ✓ Browser launched successfully');
   
-  // Log browser version
+  // Log browser version for debugging
   const version = await browser.version();
   console.log('[browser] Version:', version);
   
@@ -96,32 +198,53 @@ async function launchBrowser(options = {}) {
 }
 
 /**
- * Close browser instance gracefully
- * @param {Browser} browser
+ * Closes a browser instance gracefully
+ * First closes all pages, then closes the browser
+ * Falls back to force kill if graceful close fails
+ * 
+ * @async
+ * @param {import('puppeteer').Browser} browser - Browser instance to close
+ * @returns {Promise<void>}
+ * 
+ * @example
+ * await closeBrowser(browser);
+ * console.log('Browser closed');
  */
 async function closeBrowser(browser) {
-  if (!browser) return;
+  if (!browser) {
+    return;
+  }
   
   try {
+    // Close all pages first
     const pages = await browser.pages();
     for (const page of pages) {
-      await page.close().catch(() => {});
+      await page.close().catch(() => {});  // Ignore individual page close errors
     }
+    
+    // Close the browser
     await browser.close();
     console.log('[browser] ✓ Browser closed');
+    
   } catch (error) {
     console.error('[browser] Error closing browser:', error.message);
+    
     // Force kill if graceful close fails
     const browserProcess = browser.process();
     if (browserProcess) {
+      console.log('[browser] Force killing browser process');
       browserProcess.kill('SIGKILL');
     }
   }
 }
 
+// ============================================================
+// MODULE EXPORTS
+// ============================================================
+
 module.exports = {
   launchBrowser,
   closeBrowser,
   DEFAULT_OPTIONS,
+  getExecutablePath,
 };
-

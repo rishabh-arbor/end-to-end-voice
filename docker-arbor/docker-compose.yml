@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   interview-bot:
     platform: linux/amd64
@@ -60,10 +58,13 @@ services:
     security_opt:
       - seccomp:unconfined
     
-    # Volumes for persistence (optional)
+    # Volumes for persistence and live code updates
     volumes:
       - ./logs:/app/logs
       - ./recordings:/app/recordings
+      # Mount scripts and src for live updates without rebuild
+      - ./scripts:/app/scripts:ro
+      - ./src:/app/src:ro
     
     # Restart policy
     restart: unless-stopped
