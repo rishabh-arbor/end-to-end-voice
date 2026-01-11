@@ -281,63 +281,150 @@ function createAudioFileSaver(logger) {
  * @returns {Function} TTS playback handler function
  */
 function createTTSPlaybackHandler(logger) {
+  let consecutiveFailures = 0;
+  const MAX_CONSECUTIVE_FAILURES = 3;
+  const MAX_RETRIES = 2;
+  
   return async (base64Audio, sampleRate) => {
     const { spawn } = require('child_process');
     const fsMod = require('fs');
     const os = require('os');
     const pathMod = require('path');
     
-    return new Promise((resolve) => {
+    // Check if PulseAudio is available before attempting playback
+    const checkPulseAudio = () => {
       try {
-        // Decode base64 to raw PCM
-        const buffer = Buffer.from(base64Audio, 'base64');
-        
-        // Create temp file
-        const tmpFile = pathMod.join(os.tmpdir(), `tts_${Date.now()}.raw`);
-        fsMod.writeFileSync(tmpFile, buffer);
-        
-        logger.debug('[audio] Playing TTS via paplay:', tmpFile, 'rate:', sampleRate);
-        
-        // Play through PulseAudio
-        const paplay = spawn('paplay', [
-          '--raw',
-          '--format=s16le',
-          '--channels=1',
-          `--rate=${sampleRate || 24000}`,
-          tmpFile,
-        ], {
-          env: {
-            ...process.env,
-            PULSE_SERVER: process.env.PULSE_SERVER || 'unix:/run/pulse/native',
-            XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || '/run/pulse',
-          },
-        });
-        
-        paplay.on('close', (code) => {
-          cleanupTempFile(tmpFile);
-          if (code !== 0) {
-            logger.error('[audio] paplay exited with code:', code);
-          }
-          resolve();
-        });
-        
-        paplay.on('error', (err) => {
-          logger.error('[audio] paplay error:', err.message);
-          cleanupTempFile(tmpFile);
-          resolve();
-        });
-        
-        // Timeout safety
-        setTimeout(() => {
-          paplay.kill();
-          cleanupTempFile(tmpFile);
-          resolve();
-        }, 10000);
-        
-      } catch (error) {
-        logger.error('[audio] Playback error:', error.message);
-        resolve();
+        const { execSync } = require('child_process');
+        execSync('pactl info >/dev/null 2>&1', { timeout: 1000 });
+        return true;
+      } catch {
+        return false;
       }
+    };
+    
+    // If too many consecutive failures, stop processing queue
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      logger.error('[audio] Too many consecutive playback failures. Stopping TTS queue to prevent audio burn-through.');
+      logger.error('[audio] PulseAudio may be down. Check container logs for PulseAudio status.');
+      throw new Error('TTS playback failed: PulseAudio unavailable');
+    }
+    
+    return new Promise((resolve, reject) => {
+      const playWithRetry = (retryCount = 0) => {
+        try {
+          // Verify PulseAudio is available
+          if (!checkPulseAudio()) {
+            const error = new Error('PulseAudio daemon is not running');
+            logger.error('[audio]', error.message);
+            consecutiveFailures++;
+            reject(error);
+            return;
+          }
+          
+          // Decode base64 to raw PCM
+          const buffer = Buffer.from(base64Audio, 'base64');
+          
+          // Create temp file
+          const tmpFile = pathMod.join(os.tmpdir(), `tts_${Date.now()}_${retryCount}.raw`);
+          fsMod.writeFileSync(tmpFile, buffer);
+          
+          logger.debug('[audio] Playing TTS via paplay:', tmpFile, 'rate:', sampleRate, retryCount > 0 ? `(retry ${retryCount})` : '');
+          
+          // Play through PulseAudio
+          const paplay = spawn('paplay', [
+            '--device=virtual_speaker',
+            '--raw',
+            '--format=s16le',
+            '--channels=1',
+            `--rate=${sampleRate || 24000}`,
+            tmpFile,
+          ], {
+            env: {
+              ...process.env,
+              PULSE_SERVER: process.env.PULSE_SERVER || 'unix:/run/pulse/native',
+              XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || '/run/pulse',
+            },
+          });
+          
+          let stderrOutput = '';
+          paplay.stderr.on('data', (data) => {
+            stderrOutput += data.toString();
+          });
+          
+          paplay.on('close', (code) => {
+            cleanupTempFile(tmpFile);
+            if (code !== 0) {
+              consecutiveFailures++;
+              const errorMsg = `paplay exited with code ${code}${stderrOutput ? ': ' + stderrOutput.trim() : ''}`;
+              logger.error('[audio]', errorMsg);
+              
+              // Retry if we haven't exceeded max retries
+              if (retryCount < MAX_RETRIES && code === 1) {
+                logger.warn('[audio] Retrying playback in 500ms...');
+                setTimeout(() => playWithRetry(retryCount + 1), 500);
+                return;
+              }
+              
+              // If too many failures, reject to stop queue
+              if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                logger.error('[audio] CRITICAL: TTS playback failing repeatedly. PulseAudio may be down.');
+                reject(new Error(`TTS playback failed after ${retryCount + 1} attempts: ${errorMsg}`));
+              } else {
+                resolve(); // Continue queue but log error
+              }
+            } else {
+              // Success - reset failure counter
+              consecutiveFailures = 0;
+              resolve();
+            }
+          });
+          
+          paplay.on('error', (err) => {
+            cleanupTempFile(tmpFile);
+            consecutiveFailures++;
+            logger.error('[audio] paplay spawn error:', err.message);
+            
+            // Retry if we haven't exceeded max retries
+            if (retryCount < MAX_RETRIES) {
+              logger.warn('[audio] Retrying playback in 500ms...');
+              setTimeout(() => playWithRetry(retryCount + 1), 500);
+              return;
+            }
+            
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+              reject(new Error(`TTS playback failed: ${err.message}`));
+            } else {
+              resolve();
+            }
+          });
+          
+          // Timeout safety
+          setTimeout(() => {
+            if (!paplay.killed) {
+              paplay.kill();
+              cleanupTempFile(tmpFile);
+              consecutiveFailures++;
+              logger.error('[audio] paplay timeout after 10 seconds');
+              if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                reject(new Error('TTS playback timeout'));
+              } else {
+                resolve();
+              }
+            }
+          }, 10000);
+          
+        } catch (error) {
+          consecutiveFailures++;
+          logger.error('[audio] Playback error:', error.message);
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            reject(error);
+          } else {
+            resolve();
+          }
+        }
+      };
+      
+      playWithRetry();
     });
   };
 }

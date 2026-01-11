@@ -44,11 +44,13 @@
   let captureWorklet = null;
   let pcmBuffer = [];
   let isCapturing = false;
+  let audioMerger = null;  // Channel merger for combining WebRTC downlink + virtual_mic_2
   
   // Playback state
   let playbackContext = null;
   const playbackQueue = [];
   let isPlayingTTS = false;
+  let playbackBackoffUntil = 0;  // Block new TTS chunks until this timestamp
   
   // Conversation state
   let transcriptBuffer = '';
@@ -303,12 +305,66 @@
     if (isCapturing) return;
     
     try {
-      log('info', 'Starting audio capture from page elements...');
+      log('info', 'Starting audio capture (PRIMARY: WebRTC downlink, BACKUP: virtual_mic_2)...');
       
       captureContext = new (window.AudioContext || window.webkitAudioContext)();
       
-      // Create a destination to merge all audio sources
-      const merger = captureContext.createChannelMerger(2);
+      // Create a destination to merge all audio sources (WebRTC downlink + virtual_mic_2)
+      audioMerger = captureContext.createChannelMerger(2);
+      
+      // ============================================================
+      // PRIMARY INPUT CAPTURE: WebRTC DOWNLINK (Umi's voice)
+      // WebRTC downlink track → MediaStreamSource → Capture
+      // This is the MAIN path - WebRTC audio doesn't play to speakers
+      // ============================================================
+      // Note: WebRTC downlink capture is handled in interceptWebRTC()
+      // when the 'track' event fires. See pc.addEventListener('track') below.
+      
+      // ============================================================
+      // BACKUP INPUT CAPTURE: virtual_mic_2 (browser audio output)
+      // Browser audio output → virtual_speaker_2 → virtual_mic_2 → Capture
+      // This is a FALLBACK path in case WebRTC capture fails
+      // ============================================================
+      
+      // Enumerate devices and find virtual_mic_2 for backup
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const virtualMic2 = devices.find(function(d) {
+        return d.kind === 'audioinput' && 
+               (d.label.toLowerCase().includes('virtual_mic_2') || 
+                d.label.toLowerCase().includes('virtual mic 2') ||
+                d.label.toLowerCase().includes('virtual-mic-2') ||
+                d.label.toLowerCase().includes('virtual_mic_2_input'));
+      });
+      
+      if (virtualMic2) {
+        log('info', '✓ Found virtual_mic_2 (backup capture path):', virtualMic2.label);
+        
+        try {
+          // Capture from virtual_mic_2 as backup (browser audio output)
+          const captureStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              deviceId: { exact: virtualMic2.deviceId },
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
+              googEchoCancellation: false,
+              googAutoGainControl: false,
+              googNoiseSuppression: false,
+              googHighpassFilter: false,
+            },
+            video: false
+          });
+          
+          // Connect virtual_mic_2 stream to audioMerger (backup path)
+          const captureSource = captureContext.createMediaStreamSource(captureStream);
+          captureSource.connect(audioMerger);
+          log('info', '✓ Connected virtual_mic_2 to capture pipeline (backup path)');
+        } catch (e) {
+          log('warn', '⚠️ Failed to connect virtual_mic_2 (backup):', e.message, '- will rely on WebRTC downlink only');
+        }
+      } else {
+        log('warn', '⚠️ virtual_mic_2 not found - will rely on WebRTC downlink only');
+      }
       
       // === TTS OUTPUT TO WEBRTC ===
       // Create an AudioContext for TTS output to WebRTC
@@ -367,35 +423,30 @@
           
           log('info', '📡 RTCPeerConnection created - will inject TTS audio');
           
-          // Capture incoming audio (from Umi)
           pc.addEventListener('track', function(event) {
             if (event.track.kind === 'audio') {
-              log('info', '🎤 WebRTC audio track received!');
+              log('info', '🎤 WebRTC DOWNLINK audio track received - connecting to capture pipeline');
               
               try {
                 const stream = new MediaStream([event.track]);
                 const source = captureContext.createMediaStreamSource(stream);
-                source.connect(merger);
-                log('info', '✓ Capturing WebRTC audio (Umi voice)');
+                source.connect(audioMerger);  // Connect to existing merger
+                log('info', '✓ Connected WebRTC downlink to capture (Umi voice)');
               } catch (e) {
-                log('error', 'Failed to capture WebRTC audio:', e.message);
+                log('error', 'Failed to capture WebRTC downlink:', e.message);
               }
             }
           });
           
           // Override addTrack to intercept and replace microphone track
+          // IMPORTANT: virtual_mic is used for WebRTC UPLINK only (so interview platform hears TTS)
+          // The audio flows: paplay → virtual_speaker → virtual_mic → browser → WebRTC uplink
+          // Input capture uses WebRTC DOWNLINK tracks (separate path, no feedback loop)
           const originalAddTrack = pc.addTrack.bind(pc);
           pc.addTrack = function(track, ...streams) {
             if (track.kind === 'audio') {
-              log('info', '🎙️ Intercepting outgoing audio track');
+              log('info', '🎙️ Audio track being added (using virtual_mic from PulseAudio for WebRTC uplink)');
               originalMicTrack = track;
-              
-              // Add our TTS track instead
-              const ttsTrack = ttsOutputStream.getAudioTracks()[0];
-              if (ttsTrack) {
-                log('info', '✓ Replaced microphone with TTS output stream');
-                return originalAddTrack(ttsTrack, ...streams);
-              }
             }
             return originalAddTrack(track, ...streams);
           };
@@ -406,31 +457,53 @@
         // Copy prototype
         window.RTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
         
-        // Also intercept getUserMedia to disable audio processing and capture the mic track
+        // Intercept getUserMedia to route WebRTC UPLINK through virtual_mic
+        // IMPORTANT: This is for WebRTC UPLINK only (so interview platform hears TTS)
+        // - virtual_mic monitors virtual_speaker (where TTS plays)
+        // - This allows TTS to reach the interview platform via WebRTC
+        // - Input capture uses WebRTC DOWNLINK (separate, isolated path)
         const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
         navigator.mediaDevices.getUserMedia = async function(constraints) {
-          // CRITICAL: Modify audio constraints to disable processing that filters loopback audio
           if (constraints.audio) {
-            log('info', '🎙️ getUserMedia called with audio - disabling audio processing for loopback');
+            log('info', '🎙️ getUserMedia called - routing WebRTC UPLINK through virtual_mic (TTS output path)');
+            
+            // Find virtual_mic device (monitors virtual_speaker for TTS output)
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const virtualMic = devices.find(function(d) {
+              return d.kind === 'audioinput' && 
+                     (d.label.toLowerCase().includes('virtual_mic') || 
+                      d.label.toLowerCase().includes('virtual mic') ||
+                      d.label.toLowerCase().includes('virtual-mic'));
+            });
+            
+            if (virtualMic) {
+              log('info', '✓ Found virtual_mic for WebRTC UPLINK:', virtualMic.label, virtualMic.deviceId);
+            } else {
+              log('warn', '⚠️ virtual_mic not found! Available devices:');
+              devices.filter(function(d) { return d.kind === 'audioinput'; })
+                     .forEach(function(d) { log('warn', '  -', d.label || d.deviceId); });
+            }
             
             // If audio is just 'true', replace with detailed constraints
             if (constraints.audio === true) {
               constraints.audio = {};
             }
             
-            // Disable all audio processing that might filter our TTS audio
+            // Force virtual_mic for WebRTC UPLINK and disable audio processing
+            // Note: Input capture uses WebRTC DOWNLINK (separate path, no feedback)
             constraints.audio = {
               ...constraints.audio,
-              echoCancellation: false,      // CRITICAL: Don't filter "echo" (our TTS)
-              noiseSuppression: false,      // CRITICAL: Don't suppress our audio
-              autoGainControl: false,       // Don't adjust gain
+              deviceId: virtualMic ? { exact: virtualMic.deviceId } : undefined,
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
               googEchoCancellation: false,
               googAutoGainControl: false,
               googNoiseSuppression: false,
               googHighpassFilter: false,
             };
             
-            log('info', '🔧 Audio constraints modified:', JSON.stringify(constraints.audio));
+            log('info', '🔧 Audio constraints for WebRTC UPLINK:', JSON.stringify(constraints.audio));
           }
           
           const stream = await originalGetUserMedia(constraints);
@@ -439,7 +512,7 @@
             const audioTrack = stream.getAudioTracks()[0];
             if (audioTrack) {
               originalMicTrack = audioTrack;
-              log('info', '✓ Mic track captured:', audioTrack.label);
+              log('info', '✓ WebRTC UPLINK track captured (virtual_mic - TTS output path):', audioTrack.label);
             }
           }
           
@@ -449,111 +522,11 @@
         log('info', 'WebRTC interceptor installed (with audio processing disabled)');
       }
       
-      // Install WebRTC interceptor early
+      // Install WebRTC interceptor early (for TTS output to WebRTC uplink)
       interceptWebRTC();
       
-      // Aggressively scan for WebRTC audio streams
-      function captureExistingWebRTCAudio() {
-        // Scan ALL audio and video elements for srcObject
-        const allMedia = document.querySelectorAll('audio, video');
-        
-        allMedia.forEach(function(el) {
-          if (el._arborCapturedStream) return;
-          
-          try {
-            if (el.srcObject && el.srcObject instanceof MediaStream) {
-              const audioTracks = el.srcObject.getAudioTracks();
-              
-              if (audioTracks.length > 0) {
-                log('info', '🔊 Found WebRTC audio stream with', audioTracks.length, 'track(s)');
-                
-                audioTracks.forEach(function(track, idx) {
-                  log('info', '  Track', idx + ':', track.label || 'unlabeled', 'enabled:', track.enabled);
-                });
-                
-                const source = captureContext.createMediaStreamSource(el.srcObject);
-                source.connect(merger);
-                el._arborCapturedStream = true;
-                log('info', '✓ Now capturing WebRTC audio (Umi voice)!');
-              }
-            }
-          } catch (e) {
-            if (!el._arborCaptureError) {
-              log('debug', 'Cannot capture stream:', e.message);
-              el._arborCaptureError = true;
-            }
-          }
-        });
-        
-        // Also check for any LiveKit specific elements
-        const lkElements = document.querySelectorAll('[data-lk-source]');
-        lkElements.forEach(function(el) {
-          if (el._arborCapturedStream) return;
-          
-          try {
-            if (el.srcObject) {
-              const source = captureContext.createMediaStreamSource(el.srcObject);
-              source.connect(merger);
-              el._arborCapturedStream = true;
-              log('info', '✓ Captured LiveKit element audio');
-            }
-          } catch (e) {
-            // Ignore
-          }
-        });
-      }
-      
-      // Function to capture audio from media elements
-      function captureMediaElements() {
-        // Try to capture existing WebRTC audio
-        captureExistingWebRTCAudio();
-        
-        const audioElements = document.querySelectorAll('audio, video');
-        let captured = 0;
-        
-        audioElements.forEach(function(el) {
-          if (el._arborCaptured) return; // Already capturing this element
-          
-          try {
-            // For elements with srcObject (WebRTC streams)
-            if (el.srcObject) {
-              const source = captureContext.createMediaStreamSource(el.srcObject);
-              source.connect(merger);
-              el._arborCaptured = true;
-              captured++;
-              log('info', 'Capturing WebRTC stream from:', el.tagName);
-              return;
-            }
-            
-            // For regular media elements
-            const source = captureContext.createMediaElementSource(el);
-            
-            // Connect to both destination (so it still plays) and our capture
-            source.connect(captureContext.destination);
-            source.connect(merger);
-            
-            el._arborCaptured = true;
-            captured++;
-            log('info', 'Capturing audio from:', el.tagName, el.src ? el.src.slice(0, 50) : 'stream');
-          } catch (e) {
-            // Element might already be connected or cross-origin
-            if (!el._arborCaptureError) {
-              log('debug', 'Cannot capture element:', e.message);
-              el._arborCaptureError = true;
-            }
-          }
-        });
-        
-        if (captured > 0) {
-          log('info', 'Captured', captured, 'new audio elements');
-        }
-      }
-      
-      // Initial capture
-      captureMediaElements();
-      
-      // Monitor for new audio elements
-      mediaElementMonitorInterval = setInterval(captureMediaElements, 2000);
+      // Note: We no longer capture from media elements or WebRTC streams
+      // All input capture now comes from virtual_mic_2 (browser audio output)
       
       // Calculate samples per chunk
       const samplesPerChunk = Math.floor(captureContext.sampleRate * AUDIO_CHUNK_DURATION_MS / 1000);
@@ -579,22 +552,35 @@
       await captureContext.audioWorklet.addModule(url);
       captureWorklet = new AudioWorkletNode(captureContext, 'pcm-capture-processor');
       
-      // Handle incoming audio samples
+      // Handle incoming audio samples from virtual_mic_2 (browser audio output)
+      // IMPORTANT: This captures browser audio output (separate from TTS output path)
+      // - TTS output: virtual_speaker → virtual_mic → WebRTC UPLINK (interview hears TTS)
+      // - Input capture: Browser audio → virtual_speaker_2 → virtual_mic_2 → This capture → STT
+      // These are isolated paths, but we gate during TTS as extra safety
       captureWorklet.port.onmessage = function(event) {
         if (isPlayingTTS || isWaitingForResponse) {
-          // Skip capture during TTS/cooldown to avoid echo
+          // Extra safety: Skip capture during TTS/cooldown (even though paths are isolated)
           return;
         }
         
         const samples = event.data;
         
         // Check if there's actual audio (not silence)
+        // Lowered threshold from 0.01 to 0.001 to catch quieter audio
         let hasAudio = false;
+        let maxAmplitude = 0;
         for (let i = 0; i < samples.length; i++) {
-          if (Math.abs(samples[i]) > 0.01) {
+          const amp = Math.abs(samples[i]);
+          if (amp > maxAmplitude) maxAmplitude = amp;
+          if (amp > 0.001) {  // Lowered threshold for better sensitivity
             hasAudio = true;
             break;
           }
+        }
+        
+        // Debug: Log occasionally to verify audio is being captured
+        if (Math.random() < 0.01) {  // Log ~1% of chunks for debugging
+          log('debug', 'Audio chunk stats - maxAmplitude:', maxAmplitude.toFixed(4), 'hasAudio:', hasAudio, 'samples:', samples.length);
         }
         
         if (!hasAudio) return; // Skip silent chunks
@@ -613,11 +599,11 @@
         }
       };
       
-      // Connect merger to capture worklet
-      merger.connect(captureWorklet);
+      // Connect audioMerger to capture worklet
+      audioMerger.connect(captureWorklet);
       
       isCapturing = true;
-      log('info', '✓ Audio capture started (monitoring page elements)');
+      log('info', '✓ Audio capture started (PRIMARY: WebRTC downlink, BACKUP: virtual_mic_2)');
       
     } catch (e) {
       log('error', 'Failed to start audio capture:', e.message);
@@ -665,16 +651,31 @@
   function playAudioBase64(base64Data, sampleRate) {
     sampleRate = sampleRate || 24000;
     console.log('[arbor] playAudioBase64 called, queue length:', playbackQueue.length, 'isPlaying:', isPlayingTTS);
-    
+
+    // Check if we're in backoff period (after PulseAudio errors)
+    const now = Date.now();
+    if (playbackBackoffUntil > now) {
+      const remainingMs = playbackBackoffUntil - now;
+      console.log('[arbor] In backoff period, rejecting chunk (', remainingMs, 'ms remaining)');
+      return; // Reject chunk during backoff
+    }
+
     // Accumulate response audio chunks for saving
     responseAudioChunks.push(base64Data);
-    
+
     // Queue for sequential playback
     playbackQueue.push({ data: base64Data, rate: sampleRate });
-    
-    if (!isPlayingTTS) {
-      console.log('[arbor] Starting playNextFromQueue...');
+
+    // ✅ ATOMIC CHECK: Only start processing if queue was empty BEFORE we added our chunk
+    // This prevents multiple concurrent calls even within the same event loop tick
+    // If queue.length === 1, we're the first chunk - start processing
+    // If queue.length > 1, another chunk is already being processed - let it continue
+    if (playbackQueue.length === 1 && !isPlayingTTS) {
+      isPlayingTTS = true;
+      console.log('[arbor] Starting playNextFromQueue (queue was empty, we are first)...');
       playNextFromQueue();
+    } else {
+      console.log('[arbor] Chunk queued (processor already running, queue:', playbackQueue.length, ')');
     }
   }
   
@@ -703,7 +704,8 @@
       return;
     }
     
-    isPlayingTTS = true;
+    // Remove this line - flag already set in playAudioBase64
+    // isPlayingTTS = true;
     const item = playbackQueue.shift();
     
     try {
@@ -727,27 +729,48 @@
       // ============================================================
       if (hasPaplayBridge) {
         console.log('[arbor] PRIMARY: Playing via paplay (real audio flow to Umi)');
-        await window.__arborPlayAudio(item.data, item.rate);
-        console.log('[arbor] paplay completed');
+        try {
+          await window.__arborPlayAudio(item.data, item.rate);
+          console.log('[arbor] paplay completed');
+        } catch (error) {
+          log('error', 'TTS playback failed:', error.message);
+          log('error', 'Stopping TTS queue - PulseAudio may be down');
+          // Clear the queue to prevent burning through all chunks
+          playbackQueue.length = 0;
+          isPlayingTTS = false;
+          // Notify that audio failed
+          log('warn', '⚠️ TTS audio playback failed. Interview may be stuck. Check PulseAudio status.');
+          throw error; // Re-throw to stop processing
+        }
       }
       
       // ============================================================
       // SECONDARY/FALLBACK: WebRTC injection (if paplay fails)
       // Only used as backup - directly injects into WebRTC stream
       // ============================================================
-      else if (hasWebRTCBridge) {
-        console.log('[arbor] FALLBACK: Using WebRTC injection (paplay not available)');
-        await window.__arborPlayTTSToWebRTC(pcmData, item.rate);
-        console.log('[arbor] WebRTC injection completed');
-      } else {
-        console.warn('[arbor] No audio playback method available!');
+       else {
+        console.warn('[arbor] paplay bridge not available! Audio will not reach Umi.');
+        console.warn('[arbor] Make sure __arborPlayAudio is exposed from Node.js');
+
       }
     } catch (e) {
       console.error('[arbor] Playback error:', e.message);
+      // If it's a critical error (PulseAudio down), stop the queue AND enable backoff
+      if (e.message && (e.message.includes('PulseAudio') || e.message.includes('TTS playback failed'))) {
+        playbackQueue.length = 0;
+        isPlayingTTS = false;
+
+        // Enable 5-second backoff to prevent rapid chunk arrivals from causing race condition
+        playbackBackoffUntil = Date.now() + 5000;
+        log('error', 'CRITICAL: TTS playback failed. Stopping queue and entering 5s backoff period.');
+        return; // Don't continue processing
+      }
     }
     
-    // Continue with next chunk
-    setTimeout(playNextFromQueue, 50);
+    // Continue with next chunk immediately (playback already awaited above)
+    if (isPlayingTTS) {
+      playNextFromQueue();  // No setTimeout - we already awaited paplay completion
+    }
   }
   
   async function playViaBrowser(base64Data, sampleRate) {
@@ -957,6 +980,65 @@
     connectTTS();
   }
   
+  function processBufferedQuestion() {
+    const question = transcriptBuffer.trim();
+    if (question.length > 0) {
+      log('info', '⏱️ Processing question...');
+      
+      // Save captured audio file before processing
+      if (capturedAudioChunks.length > 0 && window.__arborSaveAudioFile) {
+        const questionId = Date.now();
+        currentQuestionId = questionId;
+        
+        // Combine all captured chunks
+        const totalLength = capturedAudioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const combined = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const chunk of capturedAudioChunks) {
+          combined.set(chunk, offset);
+          offset += chunk.length;
+        }
+        
+        // Convert to base64
+        let binary = '';
+        const chunkSize = 8192;
+        for (let i = 0; i < combined.length; i += chunkSize) {
+          const chunk = combined.subarray(i, Math.min(i + chunkSize, combined.length));
+          binary += String.fromCharCode.apply(null, chunk);
+        }
+        const base64 = btoa(binary);
+        
+        // Get sample rate from capture context or default
+        const sampleRate = (captureContext && captureContext.sampleRate) ? captureContext.sampleRate : 48000;
+        
+        // Save captured audio file
+        window.__arborSaveAudioFile(base64, `captured_audio_${questionId}.pcm`, sampleRate).catch(e => {
+          log('warn', 'Failed to save captured audio:', e.message);
+        });
+        
+        // Save converted audio (same as captured for now)
+        window.__arborSaveAudioFile(base64, `converted_audio_${questionId}.pcm`, sampleRate).catch(e => {
+          log('warn', 'Failed to save converted audio:', e.message);
+        });
+        
+        // Clear captured chunks
+        capturedAudioChunks = [];
+      }
+      
+      // Check if this is the same question as before
+      if (isSameQuestion(question, lastQuestion)) {
+        log('info', '🔄 Same question detected, asking to repeat...');
+        askToRepeatQuestion();
+      } else {
+        // New question - store it and generate response
+        lastQuestion = question;
+        generateResponse(question);
+      }
+      
+      transcriptBuffer = '';
+    }
+  }
+  
   function handleSTTResponse(serverContent) {
     // Input transcription (interviewer's speech)
     if (serverContent.inputTranscription) {
@@ -990,62 +1072,7 @@
           
         // Wait for silence before responding
         responseTimer = setTimeout(function() {
-          const question = transcriptBuffer.trim();
-          if (question.length > 0) {
-            log('info', '⏱️ Processing question...');
-            
-            // Save captured audio file before processing
-            if (capturedAudioChunks.length > 0 && window.__arborSaveAudioFile) {
-              const questionId = Date.now();
-              currentQuestionId = questionId;
-              
-              // Combine all captured chunks
-              const totalLength = capturedAudioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-              const combined = new Uint8Array(totalLength);
-              let offset = 0;
-              for (const chunk of capturedAudioChunks) {
-                combined.set(chunk, offset);
-                offset += chunk.length;
-              }
-              
-              // Convert to base64
-              let binary = '';
-              const chunkSize = 8192;
-              for (let i = 0; i < combined.length; i += chunkSize) {
-                const chunk = combined.subarray(i, Math.min(i + chunkSize, combined.length));
-                binary += String.fromCharCode.apply(null, chunk);
-              }
-              const base64 = btoa(binary);
-              
-              // Get sample rate from capture context or default
-              const sampleRate = (captureContext && captureContext.sampleRate) ? captureContext.sampleRate : 48000;
-              
-              // Save captured audio file
-              window.__arborSaveAudioFile(base64, `captured_audio_${questionId}.pcm`, sampleRate).catch(e => {
-                log('warn', 'Failed to save captured audio:', e.message);
-              });
-              
-              // Save converted audio (same as captured for now)
-              window.__arborSaveAudioFile(base64, `converted_audio_${questionId}.pcm`, sampleRate).catch(e => {
-                log('warn', 'Failed to save converted audio:', e.message);
-              });
-              
-              // Clear captured chunks
-              capturedAudioChunks = [];
-            }
-            
-            // Check if this is the same question as before
-            if (isSameQuestion(question, lastQuestion)) {
-              log('info', '🔄 Same question detected, asking to repeat...');
-              askToRepeatQuestion();
-            } else {
-              // New question - store it and generate response
-              lastQuestion = question;
-              generateResponse(question);
-            }
-            
-            transcriptBuffer = '';
-          }
+          processBufferedQuestion();
         }, RESPONSE_DELAY_MS);
         }
       }
@@ -1076,10 +1103,15 @@
   
   function sendAudioToLLM(pcmData, sampleRate) {
     if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN || !geminiReady) {
+      log('debug', 'Cannot send audio - STT not ready (readyState:', geminiWs ? geminiWs.readyState : 'null', 'geminiReady:', geminiReady, ')');
       return;
     }
     
     try {
+      // Debug: Log occasionally to verify audio is being sent
+      if (Math.random() < 0.05) {  // Log ~5% of chunks for debugging
+        log('debug', 'Sending audio chunk to STT - size:', pcmData.length, 'samples, rate:', sampleRate);
+      }
       // Convert to Int16Array
       const pcm16 = new Int16Array(pcmData);
       const bytes = new Uint8Array(pcm16.buffer);
@@ -1171,7 +1203,20 @@
     cooldownTimer = setTimeout(function() {
       isPlayingTTS = false;
       isWaitingForResponse = false;
-      transcriptBuffer = '';
+      
+      // Check if we have buffered transcriptions that came in during cooldown
+      if (transcriptBuffer.trim().length > 0) {
+        log('info', '📝 Processing buffered transcriptions after cooldown...');
+        // Process the buffered question after a short delay
+        if (responseTimer) clearTimeout(responseTimer);
+        responseTimer = setTimeout(function() {
+          processBufferedQuestion();
+        }, RESPONSE_DELAY_MS);
+      } else {
+        // No buffered transcriptions, clear the buffer and continue
+        transcriptBuffer = '';
+      }
+      
       isInCooldown = false;
       hasAskedToRepeat = false;  // Reset repeat flag after cooldown
       log('info', '✓ Ready for next question');

@@ -100,6 +100,12 @@ const DEFAULT_OPTIONS = {
     // Enable PulseAudio support and loopback features
     '--enable-features=PulseAudioLoopbackForScreenShare,PulseAudioLoopbackForCast',
     
+    // CRITICAL: Force ALSA to use PulseAudio (via .asoundrc)
+    '--alsa-output-device=default',
+    
+    // CRITICAL: Allow audio service to access PulseAudio socket
+    '--enable-audio-service-sandbox=false',
+    
     // CRITICAL: Disable audio processing that filters loopback audio
     // Echo cancellation/noise suppression would remove our TTS audio
     '--disable-features=WebRtcAecDump,AudioServiceOutOfProcess,WebRtcUseEchoCanceller3',
@@ -182,8 +188,23 @@ async function launchBrowser(options = {}) {
     args: [...DEFAULT_OPTIONS.args, ...(options.args || [])],
   };
   
+  // CRITICAL: Add PulseAudio environment variables to browser process
+  // This ensures Chromium uses PulseAudio instead of falling back to ALSA/dummy
+  mergedOptions.env = {
+    ...process.env,
+    // PulseAudio connection
+    PULSE_SERVER: process.env.PULSE_SERVER || 'unix:/run/pulse/native',
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || '/run/pulse',
+    // ALSA will route through PulseAudio via .asoundrc
+    ALSA_CARD: 'PULSE',
+  };
+  
   console.log('[browser] Launching browser with executable:', mergedOptions.executablePath);
   console.log('[browser] Headless:', mergedOptions.headless);
+  console.log('[browser] PulseAudio env:', {
+    PULSE_SERVER: mergedOptions.env.PULSE_SERVER,
+    XDG_RUNTIME_DIR: mergedOptions.env.XDG_RUNTIME_DIR,
+  });
   
   // Launch browser
   const browser = await puppeteer.launch(mergedOptions);
