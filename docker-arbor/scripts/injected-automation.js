@@ -50,6 +50,14 @@
   const playbackQueue = [];
   let isPlayingTTS = false;
   
+  // Debug tracking for RCA
+  let debugLogId = 0;
+  let activePlayNextCalls = 0;
+  let lastChunkArrivalTime = 0;
+  let lastFlagChangeTime = 0;
+  let lastFlagChangeReason = '';
+  let playbackStartTimes = new Map();
+  
   // Conversation state
   let transcriptBuffer = '';
   let isWaitingForResponse = false;
@@ -309,38 +317,42 @@
       
       // Create a destination to merge all audio sources
       const merger = captureContext.createChannelMerger(2);
-      
+
+      // Track WebRTC sources - store globally so worklet can access
+      window._arborHasWebRTCSource = false;
+
       // Intercept RTCPeerConnection to capture WebRTC audio
       function interceptWebRTC() {
         if (window._arborWebRTCIntercepted) return;
         window._arborWebRTCIntercepted = true;
-        
+
         const OriginalRTCPeerConnection = window.RTCPeerConnection;
-        
+
         window.RTCPeerConnection = function(config) {
           const pc = new OriginalRTCPeerConnection(config);
-          
+
           pc.addEventListener('track', function(event) {
             if (event.track.kind === 'audio') {
-              log('info', '🎤 WebRTC audio track received!');
-              
+              log('info', '🎤 WebRTC audio track received (Umi downlink)!');
+
               try {
                 const stream = new MediaStream([event.track]);
                 const source = captureContext.createMediaStreamSource(stream);
                 source.connect(merger);
-                log('info', '✓ Capturing WebRTC audio (Umi voice)');
+                window._arborHasWebRTCSource = true;
+                log('info', '✓ Capturing WebRTC downlink audio (Umi voice - will NOT skip during TTS)');
               } catch (e) {
                 log('error', 'Failed to capture WebRTC audio:', e.message);
               }
             }
           });
-          
+
           return pc;
         };
-        
+
         // Copy prototype
         window.RTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
-        
+
         log('info', 'WebRTC interceptor installed');
       }
       
@@ -476,11 +488,16 @@
       
       // Handle incoming audio samples
       captureWorklet.port.onmessage = function(event) {
-        if (isPlayingTTS || isWaitingForResponse) {
-          // Skip capture during TTS/cooldown to avoid echo
-          return;
-        }
-        
+        // IMPORTANT FIX: Don't skip WebRTC downlink (Umi's voice) during TTS/cooldown
+        // Only skip if we don't have a WebRTC source (which would be echo from TTS)
+        //
+        // The problem was: agent plays TTS → sets isPlayingTTS=true → blocks ALL audio for 15s
+        // But Umi might be speaking during this time! So we miss her questions.
+        //
+        // The fix: If we have WebRTC downlink, ALWAYS capture it (it's Umi's voice, not echo)
+        // Echo comes from virtual_mic monitoring virtual_speaker, which we can't fully prevent
+        // in commit 1's simple architecture, but it's acceptable since Gemini filters it via STT
+
         const samples = event.data;
         
         // Check if there's actual audio (not silence)
